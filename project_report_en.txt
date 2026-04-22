@@ -1,0 +1,706 @@
+================================================================================
+Project Report: Distillation (SFT) + GRPO + Test-Time Scaling Pipeline for
+Small-Model Math Reasoning
+================================================================================
+
+Goals and Motivation
+----------------
+
+Starting from a small base model (Qwen3-0.6B-Base), improve its math reasoning
+ability in three stages:
+
+  (1) Distillation (SFT): Generate step-by-step proof-style answers from a
+      stronger teacher model, filter them, then run SFT with hard labels.
+      In this project "distillation" and "SFT" are actually the same thing —
+      we did not use soft logit distillation (the reasons are described
+      below); instead we treat the teacher's outputs as ground truth and let
+      the small model do supervised fine-tuning directly. So the
+      distillation stage and the SFT stage are described jointly below.
+
+  (2) GRPO: On math problems with verifiable answers, use GRPO to further
+      strengthen the checkpoint produced by Distillation (SFT).
+
+  (3) Test-time scaling / Inference-time scaling: At evaluation time we do
+      not look only at single-sample accuracy, but instead use a set of
+      metrics — greedy / avg@1 / cons@N / wcons@N / pass@N — combined
+      with majority vote, logprob-weighted voting, and tie breaking to
+      squeeze out extra performance. The student's chain of thought is
+      not triggered by prompts like "let's think step by step" nor wrapped
+      in <think> tags; the step-by-step format is baked into the weights
+      during Distillation (SFT). Logprob-triggered self-refinement and
+      adaptive-N early stopping are natural next-step extensions.
+
+RL methods such as GRPO / DAPO have a long engineering pipeline, depend on
+verifiable rewards, and are themselves already relatively mature methods, so
+their marginal returns are limited. This project therefore puts its main
+effort on distillation and test-time scaling, taking the final model
+performance as the yardstick. To simplify the training pipeline, the GRPO
+stage does not introduce additional pretraining / replay tasks for
+mitigating catastrophic forgetting; this trade-off is consistent with the
+removal of the KL-divergence penalty term described below.
+
+The report roughly follows the order in which the scripts in the repository
+are run.
+
+
+--------------------------------------------------------------------------------
+Final Evaluation Results (Quick Look)
+--------------------------------------------------------------------------------
+
+Evaluation is done on math500_test.json, a set that is held out from
+training throughout the project, used to measure generalization. Accuracies
+under greedy single-sample sampling are as follows:
+
+  - Qwen/Qwen3-0.6B-Base (HuggingFace original, without any fine-tuning)
+      MATH-500 (vLLM): 500/500
+      Accuracy: 14.60% (73/500)   |  wall time: 16.2s
+
+  - The model trained in this project (Distillation (SFT) + GRPO)
+      Checkpoint: https://huggingface.co/yaotianhao/Qwen3-0.6B-Math-SFT-GRPO
+      MATH-500 (vLLM): 500/500
+      Accuracy: 47.20% (236/500)  |  wall time: 26.4s
+
+      TTS : n=16, temperature=0.7, top_p=0.95, logprobs=True
+      avg@1     :  44.54%   (no TTS, baseline)
+      cons@16   :  57.20%   (majority vote)
+      wcons@16  :  57.20%   (logprob-weighted vote)
+      pass@16   :  75.40%   (oracle upper bound)
+      wall time :  414.9s
+
+  - The follow-up SFT-only checkpoint tuned to its best (no GRPO)
+      Checkpoint: https://huggingface.co/yaotianhao/Qwen3-0.6B-Math-SFT
+      MATH-500 (vLLM): 500/500
+      Accuracy: 46.40% (232/500)  |  wall time: 26.0s
+
+      TTS : n=16, temperature=0.7, top_p=0.95, logprobs=True
+      avg@1     :  42.85%   (no TTS, baseline)
+      cons@16   :  56.00%   (majority vote)
+      wcons@16  :  56.00%   (logprob-weighted vote)
+      pass@16   :  73.80%   (oracle upper bound)
+      wall time :  405.5s
+
+Side-by-side examples (base wrong / trained model right)
+
+To make the accuracy gap concrete, here are two problems picked from
+the 176 cases where base is wrong but the trained model is right. In
+both, base just emits a wrong answer with no real derivation (typical
+of its 14.60% accuracy), while the trained model breaks the problem
+down in Step 1 / Step 2 / ... form and reaches the correct answer.
+
+  Example 1: alternating sum (MATH-500 idx=16)
+    Problem: Compute $1-2+3-4+5- \dots +99-100$.
+    Ground truth: -50
+    Base:            \boxed{100}                          (wrong)
+    Trained model:   pair (1-2), (3-4), ..., (99-100);
+                     each pair = -1, 50 pairs in total,
+                     50 * (-1) = -50. \boxed{-50}         (correct)
+
+  Example 2: 90-degree rotation in the complex plane (idx=28)
+    Problem: A $90^\circ$ rotation around the origin in the
+             counter-clockwise direction is applied to $7 + 2i$.
+             What is the resulting complex number?
+    Ground truth: -2 + 7i
+    Base:            \boxed{29 + 2i}                      (wrong)
+    Trained model:   a 90-degree CCW rotation = multiply by i;
+                     (7 + 2i) * i = 7i + 2 i^2 = -2 + 7i.
+                     \boxed{-2 + 7i}                      (correct)
+
+The full definitions of the metrics (greedy / avg@1 / cons@N / wcons@N /
+pass@N) and the discussion of test-time scaling are in Section 5.
+
+--------------------------------------------------------------------------------
+1. Distillation (SFT): Data Generation
+--------------------------------------------------------------------------------
+
+The goal of the first stage is to construct a high-quality (problem, answer)
+corpus, in which the answer is generated by a teacher model rather than
+written by humans.
+- Related script: gen_distill_answers.py (batch-samples answers from the
+  teacher)
+- Output: qwen3-235b-a22b-distillation-answer-pairs.jsonl (the unfiltered
+  raw distillation outputs; correctness / perplexity filtering happens in
+  the next section)
+
+  # With the teacher (Qwen3-235B-A22B-Instruct-2507, TP or EP=8) already
+  # served, call the teacher to batch-generate distillation answers
+  python gen_distill_answers.py \
+    --base-url http://localhost:8000/v1 \
+    --model qwen3 \
+    --input math_full_minus_math500.json \
+    --output distillation_results_new.jsonl \
+    --num-questions 12500 \
+    --num-samples 1 \
+    --concurrency 64 \
+    --max-tokens 3072
+
+The overall design has three interrelated threads: the choice of teacher,
+the design of the prompt, and the control of trace length. The shared
+purpose of all three is to let the 0.6B student really learn the proofs
+themselves within a limited token budget.
+
+- Teacher model selection
+  We use the instruct (non-thinking) tier of the Qwen3-235B-A22B-2507
+  family, deliberately not Qwen3-235B-A22B-Thinking-2507 nor any 2507
+  thinking-series checkpoint. The Thinking series trades extremely long
+  chain-of-thought for reasoning ability, and its outputs are filled with
+  self-correcting, backtracking, repeatedly-agonizing phrases such as
+  "wait...", "reconsider...", "actually, let me redo step 2...". This is
+  not a problem for large-model students, but for a 0.6B student the
+  signal-to-noise ratio of an 8k+ token long monologue is too low: the
+  truly useful proof skeleton gets drowned out by verbose filler and
+  becomes noise instead. Even the smaller thinking variants frequently
+  open with filler like "This is a difficult or complex problem.", which
+  brings no benefit to distillation. We therefore later use prompts to
+  constrain the model's output. We also compared the contemporaneously
+  updated Qwen3.6 series: although more capable, its tokenizer and
+  prompting / pretraining style are further from this project's target
+  preferences, and its architecture introduces large changes such as GDN /
+  LA, so its transferability to the 0.6B student is actually worse than
+  Qwen3-235B-A22B-Instruct-2507.
+
+- Prompt design
+  The teacher's prompt is specifically tuned to force it to output strict,
+  concise, step-by-step proofs, organized in the form
+  "Step 1 / Step 2 / Step 3 / ... / Final answer", and explicitly forbids
+  free-form inner-monologue, restarts, or any "wait, let me reconsider"
+  filler. The intuition: the shorter and more clearly structured the
+  trace, the better the chance that a small model absorbs the logical
+  structure of the proof, instead of memorizing the surface linguistic
+  habits of the teacher.
+
+- Length budget & handling of overlong samples
+  The initial distillation data used 2048 tokens as the sequence length
+  cap; this was later relaxed to 3072–4096, because some problems really
+  need more space to be expressed in full; but it is not relaxed further.
+  Samples exceeding this cap are not truncated and then trained on; they
+  are dropped entirely. The reasons are at two levels:
+    * Direct level: these samples are simply too long, and the 0.6B small
+      model can hardly really learn them. Keeping them in the training
+      set mostly introduces noise that disturbs overall convergence,
+      rather than yielding gains.
+    * Indirect level: not dropping them means truncating, and a sample
+      cut off in the middle of a proof gives the student the worst
+      possible training signal — it teaches the student to "start a
+      proof but never end it", not even producing a \boxed{}, which is
+      worse than not training on this problem at all.
+  So a rough rule is: if even an instruct teacher at the A22B scale
+  cannot do the problem within 3072–4096 tokens, treat the problem as
+  "out of scope of this pipeline" and drop it, rather than letting the
+  trace grow without limit. This rule in turn constrains the previous
+  two — choosing the instruct teacher rather than thinking, and forcing
+  the prompt to be concise, are essentially both meant to keep more
+  problems within this length budget.
+
+
+--------------------------------------------------------------------------------
+2. Filtering of Distillation Data
+--------------------------------------------------------------------------------
+
+The teacher's raw outputs contain noise and require two kinds of judgment
+and filtering.
+
+2a. Correctness filtering (LLM-as-a-judge)
+--------------------------------
+
+- Related script: run_math_judge_vllm.py (starts a vLLM judge service and
+  in batches labels each distillation sample as correct / incorrect)
+- Input: qwen3-235b-a22b-distillation-answer-pairs.jsonl
+- Outputs:
+    * qwen3-235b-a22b-distillation-answer-pairs.judged.jsonl
+      (all samples + a _judge_verdict field on each sample)
+    * qwen3-235b-a22b-distillation-answer-pairs.judged.correct.jsonl
+      (the subset keeping only _judge_verdict == "correct", used as the
+      main pool for Distillation (SFT))
+
+  # With a mid-to-large FP8 model already served by vLLM as the judge
+  # (served-model-name being qwen3-fp8), call run_math_judge_vllm.py
+  # to label each sample
+  uv run run_math_judge_vllm.py \
+    --input_json distillation_results_new.jsonl \
+    --solutions_json math_full_minus_math500.json \
+    --output_json distillation_results_new_judged.jsonl \
+    --base_url http://localhost:8000/v1 \
+    --model qwen3-fp8 \
+    --max_tokens 2048 \
+    --concurrency 64
+
+- Judging is easier than solving. For a problem the judge model itself
+  cannot reliably solve, it can still reliably tell whether "this candidate
+  proof's final answer is correct". This asymmetry is the fundamental
+  reason LLM-as-a-judge is cost-effective.
+
+- Exploiting this asymmetry, the judge can be made to run very fast. Two
+  reasonable routes:
+    * Use a smaller judge model, e.g. at the Qwen3.6-27B scale, paired with
+      FLA / GDN serving. Cheap, but in this project the prompts are
+      relatively long (the problem itself + a multi-step proof trace), and
+      a too-small judge tends to drift, producing misjudgments.
+    * Use a slightly larger judge model + more efficient serving:
+      vLLM + TP / EP, with weights in FP8. FP8 fully utilizes tensor
+      cores, roughly doubling throughput compared to BF16, while the
+      quality loss for tasks like judging is negligible; meanwhile the
+      traditional FlashAttention kernels are also more mature. We
+      ultimately adopt the FP8 mid-to-large model + vLLM scheme, with the
+      best quality / cost ratio.
+
+- The "judged correct" subset (qwen3-235b-a22b-distillation-answer-
+  pairs.judged.correct.jsonl) is used as the main pool for Distillation
+  (SFT). We also tried keeping a small number of judged-incorrect
+  samples: the rationale is that some "wrong" cases are actually the
+  judge itself making a misjudgment, and additionally a small number of
+  near-correct samples can act as a kind of regularization. But the
+  default configuration still drops the misjudged ones.
+
+
+2b. Perplexity filtering
+-------------------
+
+- Related script: compute_perplexity_vllm.py (runs a forward pass with the
+  student base model, computes the average token logprob for each
+  (problem, answer), then exp's it to get PPL; also includes
+  deduplication logic)
+- Input: the .judged.correct.jsonl from the previous step (also includes
+  intermediate products that have already been deduplicated, such as
+  distillation_results_new_judged_correct_dedup.jsonl)
+- Output: distillation_results_new_judged_correct_dedup.ppl_filtered.jsonl
+  (the Distillation (SFT) training set after cutting off the very-high-PPL
+  tier)
+
+  # With the student base model already served by vLLM (port 8000), run
+  # compute_perplexity_vllm.py to compute the average logprob → PPL of
+  # each sample
+  uv run compute_perplexity_vllm.py \
+    --data_path distillation_results_new_judged_correct_dedup.jsonl \
+    --model /opt/tiger/tianhao.yao/models/qwen3-0.6b-base \
+    --host localhost --port 8000 \
+    --concurrency 128 \
+    --max_seq_len 6143 \
+    --out_file perplexity_results.json
+
+The starting point is the common difficulty-filtering idea — "things that
+are too hard cannot be learned, things that are too simple are not
+meaningful to learn either": samples with too-high PPL are basically beyond
+the syllabus of a 0.6B small model, and forcing it to learn them yields
+mostly rote memorization rather than generalization; samples with too-low
+PPL are information-thin, and even after learning them the gain in model
+capability is limited.
+
+But this filtering tool has obvious limitations, so it must be used with
+care:
+
+- During the distillation stage, the student needs to learn two things at
+  once: (a) the difficulty and content of the math proof itself; (b) the
+  teacher's format and organization. Perplexity mixes these two together. A
+  short, simple proof, if its format is unfamiliar to the student, can have
+  higher PPL than a long, hard proof in a familiar format — exactly the
+  opposite of the direction we want to filter on.
+
+- In the actual computation, we average per-token logprob and then exp.
+  On long answers, this average gets diluted by a large number of "glue
+  tokens" (spaces, $ $, "Step", "Therefore", newlines, etc.). The result
+  is that the signal from the few truly difficult tokens is washed out:
+  there are both false negatives (truly hard problems whose scores do not
+  look high) and false positives (some simple or moderately hard problems
+  that get classified into the "high perplexity" range because of some
+  unusual phrasing).
+
+- Therefore PPL filtering is positioned as a coarse pre-screen, not a
+  final judgment. In actual use, we pair it with manual spot-checks of
+  samples near the threshold to make sure the cut line has not gone awry.
+
+
+--------------------------------------------------------------------------------
+3. Distillation (SFT) Stage
+--------------------------------------------------------------------------------
+
+train_qwen3_0.6b_sft.py performs supervised fine-tuning of Qwen3-0.6B on the
+filtered distillation set. The output checkpoints are placed under models/,
+with names containing the data slice and the training recipe (e.g.
+qwen3-0.6b-sft-distill-a22b-allcorrect-6144-mrbl-bs8). This Distillation
+(SFT) checkpoint is the starting point for the GRPO stage that follows.
+
+  # Main SFT: starting from qwen3-0.6b-base, train 3 epochs on the
+  # filtered + deduplicated distillation set
+  uv run train_qwen3_0.6b_sft.py \
+    --data_path ./distillation_results_new_judged_correct_dedup.jsonl \
+    --model_name_or_path /opt/tiger/tianhao.yao/models/qwen3-0.6b-base \
+    --output_dir /opt/tiger/tianhao.yao/models/qwen3-0.6b-sft-distill-a22b-allcorrect-2790-mrbl-bs8-new-dedup-nfa \
+    --epochs 3 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 1 \
+    --lr 1.5e-5 \
+    --warmup_ratio 0.03 \
+    --max_grad_norm 1.0 \
+    --max_seq_len 2790 \
+    --seed 442 \
+    --attn_implementation sdpa \
+    --precision bf16-mixed \
+    --no_compile_model
+
+A few engineering considerations:
+
+- The truncation length matches the distillation length budget
+  (3072–4096). This is exactly why the previous stage went to such effort
+  to compress the teacher trace — the Distillation (SFT) loss is computed
+  on (potentially truncated) tokens, and once a long trace is cut off in
+  the middle of a proof, it amounts to teaching the student to "stop
+  halfway through writing", which is the worst possible training signal —
+  it cannot even produce a \boxed{}.
+
+- The chain of thought the student learns looks just like the teacher's
+  output: a compact "Step 1 / Step 2 / ... / Final answer" with almost no
+  filler. This is precisely the entire purpose of the prompt engineering
+  and teacher selection in the first stage.
+
+- Why not soft distillation: another common practice is to have the
+  student match the teacher's logits distribution (offline soft
+  distillation that caches logits, or online soft distillation that lets
+  the student sample itself and the teacher score along the trajectory).
+  This scheme has advantages on open-ended generation tasks, but for math
+  problems with "unique answers", expert experience and our ablations both
+  point to the same conclusion: directly learning the teacher's hard
+  labels is enough; matching the entire distribution brings more noise
+  than it offsets, and cannot make up for the additional infrastructure
+  cost (caching logits, long-term serving of the teacher, etc.).
+  Therefore the "distillation" in this pipeline is, in implementation,
+  equivalent to a regular Distillation (SFT).
+
+
+--------------------------------------------------------------------------------
+4. GRPO Stage
+--------------------------------------------------------------------------------
+
+After Distillation (SFT) is finished, we run GRPO training (grpo.py,
+train_grpo_qwen3_math.py, grpo_reward.py); the training data are math
+problems with verifiable string-equivalence rewards (a subset of
+DAPO-Math-17k, generated by prepare_dapo_300.py /
+extend_dapo_to_600.py; the training files are grpo_train_dapo300.json,
+grpo_train_dapo600.json, grpo_train_dapo1200.json respectively).
+
+Points to note:
+
+- GRPO is significantly slower than Distillation (SFT). At every GRPO
+  step, in addition to the gradient update, we also have to sample N
+  candidates (rollouts) from the current policy and compute rewards; the
+  per-step wall-clock is generally several times that of Distillation
+  (SFT). We use vLLM as the rollout backend (serve_vllm_grpo.py,
+  vllm_client.py) to bring this overhead down.
+
+    # Rollout backend: serve the current policy for the GRPO training
+    # loop to sample from
+    uv run serve_vllm_grpo.py \
+      --model models/qwen3-0.6b-sft-distill-a22b-allcorrect-6144-targeted96-lr1e-7-seed442-2 \
+      --port 8000 --max-model-len 8192 \
+      --gpu-memory-utilization 0.85 --dtype bfloat16
+
+- Reward design: GRPO's training signal comes entirely from the reward
+  function, so the definition of the reward is more critical than the
+  training loop itself. This project mainly takes the "verifiable reward
+  (RLVR)" route, while also evaluating several options (grpo_reward.py is
+  the main implementation, the rest are partly experimented with and
+  partly only reserved as interfaces):
+
+    1. Verifiable string/numeric equivalence (main)
+       Extract the final answer from \boxed{...}, and compare with the
+       ground truth using normalized string equivalence. Cheap,
+       deterministic, hallucination-free, the default choice for math
+       RLVR. The downside is that for answers that are "semantically
+       equivalent but in different forms" (e.g. 1/2 vs 0.5,
+       \frac{a+b}{2} vs \frac{b+a}{2}), it gives a false 0; effort needs
+       to go into the normalization function.
+
+    2. Math-equivalence verification (sympy / math-verify)
+       On top of (1), add a symbolic check: pass both the candidate
+       answer and the ground truth through sympy simplification, then
+       check equivalence. Can correctly handle cases like algebraic
+       identities, trigonometric identities, unit conversions, etc.
+       Stricter than pure string but much cheaper than an LLM judge. The
+       cost is that sympy occasionally times out or hangs on pathological
+       expressions, so timeout protection is needed.
+
+    3. LLM-as-a-judge as reward (vLLM serve)
+       Completely isomorphic to the "judging the distillation data
+       correctness" in Stage 2: spin up a vLLM service (FP8 mid-to-large
+       model + TP/EP), let it score each rollout 0/1 or with a finer
+       score, then feed the score back to GRPO. The advantage is that it
+       can handle dimensions like the reasonableness of the proof,
+       units, phrasing, etc. that string/sympy cannot capture; the
+       disadvantages are (a) the judge itself is noisy and introduces
+       the risk of reward hacking (the policy may learn to "cheat the
+       judge"), (b) each rollout incurs an additional LLM call,
+       significantly raising wall-clock, (c) on the training side it is
+       best to also apply truncated-importance-sampling-style
+       stabilization to the judge. This project already has the
+       infrastructure to serve an FP8 judge (run_math_judge_vllm.py),
+       and connecting it to the reward hook of GRPO is engineering-ready;
+       this is listed as a next-step extension direction.
+
+    4. Format reward
+       Give a small additional reward for output format: whether
+       \boxed{} is provided, whether it is organized as
+       Step 1 / Step 2, whether it contains "<think>" tags, etc. In the
+       setup of this project, Distillation (SFT) has already pinned the
+       format very tightly, so the marginal benefit of format reward is
+       small, and it is not enabled; but if running RLVR directly from
+       the base model, this term would become very critical.
+
+    5. Length penalty
+       Apply a linear or soft penalty on overlong traces, to prevent the
+       policy from boosting accuracy by "stretching the chain
+       indefinitely" (a common degeneration mode of RLVR). Can be used
+       in conjunction with truncation.
+
+    6. Process / step-level reward (PRM)
+       Instead of evaluating only the final answer, score step by step
+       along the reasoning. Requires training or obtaining a PRM model
+       (process reward model); the most expensive but theoretically the
+       densest signal. Under small models + math scenarios, PRM
+       stability is still evolving, so this pipeline does not introduce
+       it for now; listed as future work.
+
+    7. Multi-reward weighted / normalized aggregation
+       The above several rewards can be enabled simultaneously and
+       weighted-summed. If used, it is recommended to normalize each
+       reward within the group separately before aggregating (see the
+       GDPO idea mentioned in paragraph (e) below), to prevent the
+       magnitude of one term from swallowing the others.
+
+  The main pipeline currently uses the combination of (1) + (2) (string
+  equivalence as primary, sympy as backup); (3), the LLM-judge reward,
+  is engineering-ready and is the next-step extension direction.
+
+- For math scenarios with "verifiable scalar rewards", the standard GRPO
+  recipe can be simplified considerably. Since GRPO was proposed in 2024
+  (DeepSeekMath) and rose to fame in 2025 (DeepSeek-R1), the literature
+  has accumulated a long list of improvements. This project considers a
+  few of the most prominent of these, some actually applied, others tried
+  only in ablation:
+
+    (a) No KL loss (DAPO, Dr. GRPO, DeepSeek V3.2)
+        The KL-to-reference term yields very little for math tasks with
+        "uniquely verifiable answers". Its original intent is to prevent
+        reward hacking and style collapse, but in this project the
+        reward is numerical correctness, and the policy has a strong
+        Distillation (SFT) prior, so drift will not become pathological.
+        Setting the KL coefficient directly to 0 is what lets the model
+        actually "move". DeepSeek V3.2 further suggests adjusting KL
+        strength by domain — 0 for math, a small positive value for
+        general dialogue. Coming from the same line of reasoning: this
+        project likewise does not add pretrain / replay tasks for
+        mitigating catastrophic forgetting in the GRPO stage; the
+        premise in both cases is "the training domain is restricted to
+        math, and the SFT prior is already strong enough"; both need to
+        be re-evaluated when generalized to general multi-task
+        settings.
+
+    (b) Clip-higher (DAPO)
+        Asymmetric PPO clipping: the clipping upper bound on the
+        positive-advantage side is more lenient than on the
+        negative-advantage side (e.g. ε_high = 0.28, ε_low = 0.2).
+        Lets the policy more decisively absorb "the right way to
+        solve", avoiding repeated oscillation around some point.
+
+    (c) Token-level loss (DAPO)
+        Aggregate the loss along the token dimension instead of
+        averaging along the sequence dimension, to avoid short
+        sequences being underestimated and long sequences being
+        flattened. Especially important for long chain-of-thought.
+
+    (d) Zero-gradient filtering + Active sampling (DAPO)
+        For problems where all N rollouts in the group are right or all
+        wrong, the advantage is all 0 with no contribution to the
+        gradient, but they still occupy forward, KV cache, and memory.
+        Skip such batches directly to save compute; further, when a
+        zero-gradient prompt is encountered, resample the next one,
+        until we get one that has gradient signal before doing the
+        update, so that every step is really "worth its money".
+
+    (e) Truncated importance sampling (Yao et al., 2025)
+        Truncate the importance ratio, to mitigate the variance
+        explosion caused by inconsistency between the rollout policy
+        and the train policy. Especially relevant in scenarios with
+        vLLM rollout + a different precision/implementation training
+        backend — the logprobs on the two sides will not be exactly
+        consistent to begin with.
+
+  Concretely landed in this pipeline, we explicitly enable (a), (b), as
+  well as DAPO-style (c) and (d); (e) and more aggressive changes
+  (sequence-level IS, weight clipping, multi-reward normalization) 
+  did not enter the main pipeline and are kept for future re-evaluation 
+  when bottlenecks are encountered.
+
+
+--------------------------------------------------------------------------------
+5. Test-Time Scaling / Evaluation
+--------------------------------------------------------------------------------
+
+The final evaluation is done on MATH-500 (math500_test.json); the
+relevant scripts are evaluate_math500_vllm.py and
+evaluate_math500_vllm_tts.py with test-time scaling, and the result files
+are math500*.json. This project deliberately does not report only one
+number, but a set of metrics, because each measures a different aspect:
+
+  # With the SFT checkpoint to be evaluated already served by vLLM
+  # (served-model-name being qwen3-0.6b-sft), run the MATH-500
+  # evaluation
+  uv run evaluate_math500_vllm.py \
+    --port 8000 \
+    --input_path math500.json \
+    --model qwen3-0.6b-sft \
+    --mode completions \
+    --dataset_size 500 \
+    --max_new_tokens 4096 \
+    --concurrency 256 \
+    --out_file math500_qwen3-0.6b-sft_vllm.json
+
+  # Output example:
+  #   MATH-500 (vLLM): 500/500 | ETA: 00s
+  #   Accuracy: 46.40% (232/500)  |  wall time: 26.0s
+  #   Wrote per-problem results to math500_qwen3-0.6b-sft_vllm.json
+
+
+- Greedy accuracy: single sampling at temperature=0. The cheapest and
+  most reproducible "is the answer the model itself most believes in
+  correct" metric. Sensitive to single-token deviations.
+
+- avg@1: at non-zero temperature, the average accuracy over a single
+  independent sample. With good calibration it is generally slightly
+  below greedy; if the greedy mode happens to be a "confidently wrong"
+  answer while the surrounding sample space contains quite a few correct
+  answers, then avg@1 will instead be higher than greedy.
+
+- pass@N: the problem counts as solved if any of the N independent
+  samples is correct. The upper bound that test-time search can reach.
+  Used as a "potential" metric — if pass@N is much greater than avg@1,
+  the model knows how to solve some samples, and the bottleneck is in
+  the selector rather than capability.
+
+- cons@N (majority vote / self-consistency): take the most frequent
+  final answer after N samples. The cheapest test-time scaler, almost
+  always better than avg@1 on math tasks.
+
+- wcons@N (confidence-weighted consistency): on top of cons@N, weight
+  by per-sample confidence, e.g. the average logprob over the final
+  answer span, or the judge's score. With reasonable model
+  calibration it is generally better than pure cons@N; with poor
+  calibration it degrades but not by much.
+
+Examining greedy / avg@1 / cons@N / wcons@N / pass@N jointly lets one
+distinguish different failure modes:
+    - greedy low, pass@N high            → sampling / selection problem
+                                            (capability is enough but
+                                            the selector is not)
+    - greedy ≈ pass@N, both low          → capability bottleneck, need
+                                            stronger Distillation
+                                            (SFT) / GRPO
+    - cons@N much higher than avg@1      → policy is correct on average,
+                                            but single-sample noise is
+                                            large
+    - wcons@N much higher than cons@N    → confidence signal is
+                                            effective, worth turning
+                                            into a formal verifier
+
+Test-time scaling methods currently enabled in this project:
+
+  - Majority vote / self-consistency (cons@N): take the most frequent
+    final answer across N independent samples. The cheapest TTS method
+    and almost always better than avg@1.
+  - Weighted majority vote (wcons@N): the same vote weighted by the
+    average logprob over each sample's final-answer span — equivalent
+    to self-consistency with a built-in confidence signal.
+  - Tie breaking: when votes tie, break the tie by average (or max)
+    logprob, preferring the branch the model is more confident in,
+    instead of falling back to a random / first-seen pick.
+  - Distilled-in chain of thought (not prompt-triggered): the student's
+    CoT is not triggered by prompts like "let's think step by step" and
+    is not wrapped in <think> tags. The
+    "Step 1 / Step 2 / ... / Final answer" format is baked into the
+    weights during Distillation (SFT). Reasoning therefore does not
+    degrade under system-prompt rewrites or chat-template changes, and
+    all TTS strategies above assume "the model reasons by default".
+
+Next-step directions, infrastructure-ready but not yet in pipeline:
+
+  - Self-reflection / self-correction / self-refinement: have the model
+    critique and revise its own answer (Self-Refine / Reflexion style),
+    triggered by logprob + heuristics — run a second pass only when the
+    final-answer span logprob is below a threshold, or when cons@N
+    still shows disagreement; after refining, accept once the logprob
+    improvement crosses a target, and stop iterating once the
+    improvement plateaus (or falls below threshold), so already
+    "confident and consistent" samples do not burn extra compute.
+  - Logprob-based early exit / adaptive N: while sampling, monitor
+    accumulated confidence online (top-answer vote count × average
+    logprob); stop as soon as it crosses a threshold, approaching the
+    accuracy of fixed N with far fewer samples.
+
+
+--------------------------------------------------------------------------------
+6. Pipeline Overview
+--------------------------------------------------------------------------------
+
+     Teacher (instruct, no 2507-thinking)
+         |  strict step-by-step prompt, length truncation
+         v
+     Raw distillation traces
+         |  LLM-as-a-judge (FP8 vLLM serve, TP/EP) → drop wrong answers
+         |  Perplexity filter (scored under student base model) → drop
+         |    high-PPL with care
+         v
+     Distillation (SFT) corpus (sft.jsonl, ...dedup.jsonl,
+                                ...ppl_filtered.jsonl)
+         |  train_qwen3_0.6b_sft.py (hard-label Distillation (SFT))
+         v
+     Distillation (SFT) checkpoint (models/qwen3-0.6b-sft-distill-...)
+         |  GRPO on DAPO-Math-17k, verifiable reward
+         |  (KL off, clip-higher, in-group relative advantage)
+         v
+     GRPO checkpoint (grpo_runs/.../step-XXXXX-pXXXXX)
+         |  test-time scaling on MATH-500
+         |  greedy / avg@1 / cons@N / wcons@N / pass@N
+         |  cons@N + logprob-weighted vote + tie breaking
+         |  CoT is baked in by SFT, not prompt-triggered / <think>-tagged
+         v
+     Final reported numbers
+
+
+--------------------------------------------------------------------------------
+7. Lessons Learned
+--------------------------------------------------------------------------------
+
+1. For a 0.6B student model, the teacher's "style" matters as much as its
+   "strength". A weaker but more concise teacher is often a better
+   distillation source than a stronger but more verbose one.
+
+2. Perplexity-based data filtering is useful but very crude: the average
+   logprob of long answers is easily diluted by simple tokens, and false
+   positives are not few. Use it as a hint, in conjunction with the
+   judge's correctness filtering and manual spot-checks near the
+   threshold; do not use it as the final criterion.
+
+3. LLM-as-a-judge is the link in the data pipeline most worth investing
+   FP8 / TP / EP engineering effort in: judging is easier than solving,
+   so a "fast large-model judge" is almost always better than a "slow
+   small-model judge".
+
+4. Running GRPO on verifiable math rewards, turning off KL + clip-higher
+   are two adjustments that are clearly effective. The KL term is mainly
+   meant for open-ended tasks.
+
+5. For math distillation, hard-label Distillation (SFT) is more
+   cost-effective than soft logit distillation — the key signal is in
+   "which token to choose", not in the entire distribution. This is
+   also why "distillation" and "SFT" are actually the same thing in this
+   project.
+
+6. Evaluation must report a set of metrics
+   (greedy / avg@1 / cons@N / wcons@N / pass@N); a single number masks
+   whether the bottleneck is capability, sampling, or selection. The TTS
+   actually enabled here is the trio of majority vote +
+   logprob-weighted vote + tie breaking; the chain of thought is baked
+   into the weights by Distillation (SFT) rather than triggered by a
+   prompt, so reasoning behavior is robust to system-prompt or
+   chat-template changes. Logprob-triggered self-refinement and
+   adaptive-N early stopping are the natural next steps — both spend
+   extra compute only on uncertain or inconsistent samples, leaving
+   already "confident and consistent" ones untouched.

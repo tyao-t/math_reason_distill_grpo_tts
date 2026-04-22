@@ -1,0 +1,302 @@
+[
+  {
+    "problem": "If $x + \\frac{1}{x} = 5$, find the value of $x^4 + \\frac{1}{x^4}$.",
+    "answer": "527",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "The polynomial $x^3 - 6x^2 + 11x - 6$ has roots $a$, $b$, $c$. Find $\\frac{1}{a} + \\frac{1}{b} + \\frac{1}{c}$.",
+    "answer": "\\frac{11}{6}",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Find the constant term in the expansion of $\\left( x + \\frac{1}{x} \\right)^6$.",
+    "answer": "20",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Let $f(x) = x^2 + 1$. Find $f(f(f(0)))$.",
+    "answer": "5",
+    "subject": "Algebra",
+    "level": 2
+  },
+  {
+    "problem": "Solve for real $x$: $2^x + 2^{x+1} + 2^{x+2} = 56$.",
+    "answer": "3",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Find the smallest positive value of $k$ for which the equation $3x^2 + kx + 12 = 0$ has a real double root.",
+    "answer": "12",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "If $a$ and $b$ are positive real numbers with $a + b = 14$, find the maximum value of $ab$.",
+    "answer": "49",
+    "subject": "Algebra",
+    "level": 2
+  },
+  {
+    "problem": "Compute $\\sum_{k=0}^{8} \\left(\\frac{1}{2}\\right)^k$. Express your answer as a common fraction.",
+    "answer": "\\frac{511}{256}",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "If $\\log_2(x) + \\log_2(x - 6) = 4$, find $x$.",
+    "answer": "8",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Find the smallest real value of $f(x) = x^2 - 6x + 13$.",
+    "answer": "4",
+    "subject": "Algebra",
+    "level": 2
+  },
+  {
+    "problem": "Solve for $x$ over the reals: $\\sqrt{x + 7} = x - 5$.",
+    "answer": "9",
+    "subject": "Algebra",
+    "level": 4
+  },
+  {
+    "problem": "If $z = 3 + 4i$, find $|z^2|$.",
+    "answer": "25",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Find the units digit of $7^{2025}$.",
+    "answer": "7",
+    "subject": "Number Theory",
+    "level": 2
+  },
+  {
+    "problem": "Find the remainder when $5^{30}$ is divided by 7.",
+    "answer": "1",
+    "subject": "Number Theory",
+    "level": 3
+  },
+  {
+    "problem": "How many positive divisors does $360$ have?",
+    "answer": "24",
+    "subject": "Number Theory",
+    "level": 3
+  },
+  {
+    "problem": "Find the greatest common divisor of $132$ and $84$.",
+    "answer": "12",
+    "subject": "Number Theory",
+    "level": 2
+  },
+  {
+    "problem": "What is the smallest positive integer $n$ such that $\\binom{n}{2} > 100$?",
+    "answer": "15",
+    "subject": "Number Theory",
+    "level": 3
+  },
+  {
+    "problem": "Find the remainder when $7^{77}$ is divided by $100$.",
+    "answer": "7",
+    "subject": "Number Theory",
+    "level": 4
+  },
+  {
+    "problem": "How many positive integers less than 1000 are divisible by neither 2 nor 5?",
+    "answer": "400",
+    "subject": "Number Theory",
+    "level": 3
+  },
+  {
+    "problem": "Find the smallest positive integer $n$ such that $n^2 + n + 41$ is composite.",
+    "answer": "40",
+    "subject": "Number Theory",
+    "level": 4
+  },
+  {
+    "problem": "Find $\\gcd(2^{10} - 1, 2^{15} - 1)$.",
+    "answer": "31",
+    "subject": "Number Theory",
+    "level": 4
+  },
+  {
+    "problem": "A right triangle has legs of length $9$ and $40$. Find the length of its hypotenuse.",
+    "answer": "41",
+    "subject": "Geometry",
+    "level": 2
+  },
+  {
+    "problem": "An equilateral triangle has side length $6$. Find its area.",
+    "answer": "9\\sqrt{3}",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "A circle has area $49\\pi$. Find its circumference.",
+    "answer": "14\\pi",
+    "subject": "Geometry",
+    "level": 2
+  },
+  {
+    "problem": "A regular hexagon has side length $4$. Find its area.",
+    "answer": "24\\sqrt{3}",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "A right circular cone has radius $3$ and slant height $5$. Find its volume.",
+    "answer": "12\\pi",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "Find the distance from the point $(2, -1)$ to the line $3x - 4y + 1 = 0$.",
+    "answer": "\\frac{11}{5}",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "A triangle has sides of length $5$, $5$, and $6$. Find its area.",
+    "answer": "12",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "In triangle $ABC$, $\\sin A = \\frac{3}{5}$ and $A$ is acute. Find $\\cos(2A)$.",
+    "answer": "\\frac{7}{25}",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "A sphere has surface area $36\\pi$. Find its volume.",
+    "answer": "36\\pi",
+    "subject": "Geometry",
+    "level": 3
+  },
+  {
+    "problem": "How many ways are there to arrange the letters of the word MISSISSIPPI?",
+    "answer": "34650",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "A fair coin is flipped $6$ times. What is the probability of getting exactly $4$ heads? Express your answer as a common fraction.",
+    "answer": "\\frac{15}{64}",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "How many integers between $1$ and $100$ inclusive are divisible by $3$ or $5$?",
+    "answer": "47",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "Two fair six-sided dice are rolled. What is the probability that the sum is greater than $9$? Express your answer as a common fraction.",
+    "answer": "\\frac{1}{6}",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "How many distinct ways can $8$ identical balls be distributed among $3$ distinguishable boxes?",
+    "answer": "45",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "A committee of $4$ is to be selected from $5$ men and $4$ women so that the committee has at least one man and at least one woman. How many such committees are there?",
+    "answer": "120",
+    "subject": "Counting & Probability",
+    "level": 4
+  },
+  {
+    "problem": "A bag contains $3$ red, $4$ blue, and $5$ green marbles. Two are drawn without replacement. Find the probability that they are of different colors. Express your answer as a common fraction.",
+    "answer": "\\frac{47}{66}",
+    "subject": "Counting & Probability",
+    "level": 4
+  },
+  {
+    "problem": "Find the number of ordered pairs of positive integers $(a, b)$ with $a + b = 20$.",
+    "answer": "19",
+    "subject": "Counting & Probability",
+    "level": 2
+  },
+  {
+    "problem": "How many $3$-digit positive integers have all distinct digits?",
+    "answer": "648",
+    "subject": "Counting & Probability",
+    "level": 4
+  },
+  {
+    "problem": "Compute $\\displaystyle \\lim_{x \\to 0} \\frac{\\sin(3x)}{x}$.",
+    "answer": "3",
+    "subject": "Precalculus",
+    "level": 3
+  },
+  {
+    "problem": "Find the value of the infinite sum $\\displaystyle \\sum_{n=1}^{\\infty} \\frac{1}{n(n+1)}$.",
+    "answer": "1",
+    "subject": "Precalculus",
+    "level": 3
+  },
+  {
+    "problem": "The sequence $a_n$ satisfies $a_1 = 2$ and $a_{n+1} = 3 a_n - 2$ for $n \\ge 1$. Find $a_5$.",
+    "answer": "82",
+    "subject": "Precalculus",
+    "level": 3
+  },
+  {
+    "problem": "Find $\\displaystyle \\sum_{k=1}^{50} (2k - 1)$.",
+    "answer": "2500",
+    "subject": "Precalculus",
+    "level": 2
+  },
+  {
+    "problem": "Compute the coefficient of $x^4$ in the expansion of $(1 + x + x^2)^{10}$.",
+    "answer": "615",
+    "subject": "Algebra",
+    "level": 5
+  },
+  {
+    "problem": "A trapezoid has parallel sides of length $6$ and $10$ and the distance between them is $4$. Find its area.",
+    "answer": "32",
+    "subject": "Geometry",
+    "level": 2
+  },
+  {
+    "problem": "If $x^2 + y^2 = 25$ and $xy = 12$, find $x + y$, given $x + y > 0$.",
+    "answer": "7",
+    "subject": "Algebra",
+    "level": 3
+  },
+  {
+    "problem": "Three fair six-sided dice are rolled. What is the probability that all three show different numbers? Express your answer as a common fraction.",
+    "answer": "\\frac{5}{9}",
+    "subject": "Counting & Probability",
+    "level": 3
+  },
+  {
+    "problem": "Find the largest positive integer $n$ such that $n!$ has exactly $7$ trailing zeros in base $10$.",
+    "answer": "34",
+    "subject": "Number Theory",
+    "level": 4
+  },
+  {
+    "problem": "If $\\tan \\theta = \\frac{3}{4}$ and $\\theta$ is acute, find $\\sin(2\\theta)$. Express your answer as a common fraction.",
+    "answer": "\\frac{24}{25}",
+    "subject": "Precalculus",
+    "level": 3
+  },
+  {
+    "problem": "Find the value of $\\displaystyle \\sum_{k=1}^{20} k \\cdot \\binom{20}{k}$.",
+    "answer": "10485760",
+    "subject": "Counting & Probability",
+    "level": 4
+  }
+]

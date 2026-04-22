@@ -1,0 +1,567 @@
+================================================================================
+项目报告：小模型数学推理的 Distillation (SFT) + GRPO + Test-Time Scaling Pipeline
+================================================================================
+
+目标和动机
+----------------
+
+以一个小的 base model（Qwen3-0.6B-Base）为起点，分三个阶段提升它的数学推
+理能力：
+
+  (1) Distillation (SFT)：从一个更强的 teacher model 生成 step-by-step
+      的证明式答案，过滤后用 hard-label 做 SFT。这里的"蒸馏"和"SFT"在本
+      项目里其实是同一件事 —— 没有用 soft logit distillation（原因
+      下文描述），而是把 teacher 的输出当作 ground truth，让小模型直接做
+      监督微调。所以下文里 distillation stage 与 SFT stage 是合并描述的。
+
+  (2) GRPO：在带有可验证答案的数学题上，用 GRPO 对 Distillation (SFT)
+      后的 checkpoint 做进一步强化。
+
+  (3) Test-time scaling / Inference-time scaling：评测阶段不只看
+      single-sample 准确率，而是用 greedy / avg@1 / cons@N / wcons@N /
+      pass@N 一组指标，并配合 majority vote、logprob 加权投票、tie
+      breaking 等手段榨出额外性能。学生的 chain of thought 不靠
+      "let's think step by step" 之类的 prompt trigger，也不依赖
+      <think> 标签，而是 Distillation (SFT) 阶段就把 step-by-step 格
+      式训进权重的；后续可扩展 logprob 触发的 self-refinement 与
+      adaptive-N 早停。
+
+GRPO / DAPO 等 RL 方法工程链路较长、依赖可验证 reward，且本身已是相对
+成熟的方法，边际收益有限。本项目因此以 distillation 和 test-time
+scaling 为主要发力方向，以最终模型效果为衡量标准。出于简化训练流程的
+考虑，GRPO 阶段未额外引入用于缓解灾难性遗忘的预训练 / replay 任务，这
+一取舍与下文删除 KL 散度惩罚项一致。
+
+报告大致按照仓库里脚本的运行顺序展开。
+
+
+--------------------------------------------------------------------------------
+最终评测结果（速览）
+--------------------------------------------------------------------------------
+
+评测在 math500_test.json 上进行，该集合自始至终从训练数据中剔除（held
+out from training），用于衡量泛化效果。greedy 单次采样下的准确率如下：
+
+  - Qwen/Qwen3-0.6B-Base（HuggingFace 原版，未经任何微调）
+      MATH-500 (vLLM): 500/500
+      Accuracy: 14.60% (73/500)   |  wall time: 16.2s
+
+  - 本项目训练后的模型（Distillation (SFT) + GRPO）
+      Checkpoint: https://huggingface.co/yaotianhao/Qwen3-0.6B-Math-SFT-GRPO
+      MATH-500 (vLLM): 500/500
+      Accuracy: 47.20% (236/500)  |  wall time: 26.4s
+
+      TTS : n=16, temperature=0.7, top_p=0.95, logprobs=True
+      avg@1     :  44.54%   (no TTS, baseline)
+      cons@16   :  57.20%   (majority vote)
+      wcons@16  :  57.20%   (logprob-weighted vote)
+      pass@16   :  75.40%   (oracle upper bound)
+      wall time :  414.9s
+
+  - 后续仅 SFT 调到最优的 checkpoint（不含 GRPO）
+      Checkpoint: https://huggingface.co/yaotianhao/Qwen3-0.6B-Math-SFT
+      MATH-500 (vLLM): 500/500
+      Accuracy: 46.40% (232/500)  |  wall time: 26.0s
+
+      TTS : n=16, temperature=0.7, top_p=0.95, logprobs=True
+      avg@1     :  42.85%   (no TTS, baseline)
+      cons@16   :  56.00%   (majority vote)
+      wcons@16  :  56.00%   (logprob-weighted vote)
+      pass@16   :  73.80%   (oracle upper bound)
+      wall time :  405.5s
+
+对比示例（base 答错 / 训练后模型答对）
+
+为了让上面的准确率差异更具体，下面从 base 答错、训练后模型答对的
+176 道题里挑两道展示输出差别。两题里 base 都是不做推导直接报一个错
+答案（accuracy = 14.60% 的典型表现），训练后的模型则按 Step 1 /
+Step 2 / ... 的格式拆解题目并得到正解。
+
+  例 1：交错求和（MATH-500 idx=16）
+    题目：Compute $1-2+3-4+5- \dots +99-100$.
+    正确答案：-50
+    Base：           \boxed{100}                          （错）
+    训练后模型：     按 (1-2),(3-4),...,(99-100) 配对，
+                     每对 = -1，共 50 对，
+                     50 * (-1) = -50。 \boxed{-50}        （对）
+
+  例 2：复平面 90 度旋转（MATH-500 idx=28）
+    题目：A $90^\circ$ rotation around the origin in the
+          counter-clockwise direction is applied to $7 + 2i$.
+          What is the resulting complex number?
+    正确答案：-2 + 7i
+    Base：           \boxed{29 + 2i}                      （错）
+    训练后模型：     90 度逆时针旋转 = 乘以 i；
+                     (7 + 2i) * i = 7i + 2 i^2 = -2 + 7i。
+                     \boxed{-2 + 7i}                      （对）
+
+完整的指标定义（greedy / avg@1 / cons@N / wcons@N / pass@N）和 test-time
+scaling 的讨论见第 5 节。
+
+--------------------------------------------------------------------------------
+1. Distillation (SFT)：数据生成
+--------------------------------------------------------------------------------
+
+第一阶段的目标是构造一份高质量的 (problem, answer) 语料，其中 answer 由
+teacher model 生成而非人工撰写。
+- 相关脚本：gen_distill_answers.py（向 teacher 批量采样答案）
+- 产物：qwen3-235b-a22b-distillation-answer-pairs.jsonl（未经过滤的原始
+  distillation 输出，下一节才会做正确性 / 困惑度过滤）
+
+  # 在已 serve 起 teacher (Qwen3-235B-A22B-Instruct-2507, TP或EP=8) 的
+  # 前提下，调 teacher 批量生成 distillation 答案
+  python gen_distill_answers.py \
+    --base-url http://localhost:8000/v1 \
+    --model qwen3 \
+    --input math_full_minus_math500.json \
+    --output distillation_results_new.jsonl \
+    --num-questions 12500 \
+    --num-samples 1 \
+    --concurrency 64 \
+    --max-tokens 3072
+
+整体设计有三条相互关联的主线：teacher 的选择、prompt 的设计、以及
+trace 长度的控制。三者的共同目的都是让 0.6B 的学生在有限的 token 预算
+里真正学到证明本身。
+
+- Teacher 模型选择
+  使用 Qwen3-235B-A22B-2507 家族中的 instruct（非 thinking）档位，刻意
+  不使用 Qwen3-235B-A22B-Thinking-2507 或任何 2507 thinking 系列的
+  checkpoint。Thinking 系列是用极长的 chain of thought 换 reasoning
+  能力的，输出里充斥着 "wait..."、"reconsider..."、"actually, let me
+  redo step 2..." 这类自修正、回退、反复纠结的语句。这对大模型学生不
+  成问题，但对 0.6B 的学生而言，8k+ token 的冗长独白信噪比太低，真正
+  有用的证明骨架被淹没在啰嗦填充里，反而会成为噪声。即使是较小的
+  thinking 变体，开口也常常是 "This is a difficult or complex problem." 
+  这类填充语，对蒸馏并无增益。所以后来用 prompt 约束限制模型的输出。
+  也比较过同期更新的 Qwen3.6 系列：能力虽更强，但 tokenizer 与
+  prompting / pretraining 风格与本项目目标偏好相距更远，且架构上引入
+  了 GDN / LA 等较大改动，对 0.6B 学生的可迁移性反而不如
+  Qwen3-235B-A22B-Instruct-2507。
+
+- Prompt 设计
+  teacher 的 prompt 经过专门调试，强制它输出严格、精简、step-by-step
+  的证明，组织成 "Step 1 / Step 2 / Step 3 / ... / Final answer" 的形
+  式，并明确禁止自由发挥的内心戏、重启、各种"等等再想想"的填充语。直
+  觉是：trace 越短、结构越清晰，小模型越有机会吸收证明的逻辑结构，而
+  不是去记忆 teacher 表面的语言习惯。
+
+- 长度预算 & 超长样本的处理
+  最初的 distillation 数据使用 2048 token 作为序列长度上限，后来放宽
+  到 3072–4096，因为部分题目确实需要更多空间才能完整表达；但不再继
+  续放大。超过这一上限的样本不做截断后再训练，而是整条丢弃。原因有
+  两个层面：
+    * 直接层面：这些样本本来就太长，0.6B 的小模型很难真正学进去。让
+      它们留在训练集里更多是引入噪声，干扰整体收敛，而不是带来收益。
+    * 间接层面：不丢的话就只能截断，而一段被砍在证明中段的样本会给学
+      生最坏的训练信号 —— 教它"开始证明但永远不结尾"，连 \boxed{} 都
+      给不出来，比这道题不参与训练还糟糕。
+  所以一个粗略的判断标准是：如果 A22B 这个量级的 instruct teacher 都
+  没办法在 3072–4096 token 内做出来，就把题目当作"超出本 pipeline 适
+  用范围"丢掉，而不是让 trace 无限制增长。这条规则也反过来约束了上面
+  两条 —— teacher 选 instruct 而非 thinking、prompt 强制精简，本质上
+  都是为了让更多题目能落在这个长度预算之内。
+
+
+--------------------------------------------------------------------------------
+2. Distillation 数据的过滤
+--------------------------------------------------------------------------------
+
+teacher 的原始输出含有噪声，需要做两类评判与过滤。
+
+2a. 正确性过滤（LLM-as-a-judge）
+--------------------------------
+
+- 相关脚本：run_math_judge_vllm.py（启动一个 vLLM judge 服务，并按批
+  对每条 distillation 样本打 correct / incorrect 标签）
+- 输入：qwen3-235b-a22b-distillation-answer-pairs.jsonl
+- 产物：
+    * qwen3-235b-a22b-distillation-answer-pairs.judged.jsonl
+      （所有样本 + 每条样本的 _judge_verdict 字段）
+    * qwen3-235b-a22b-distillation-answer-pairs.judged.correct.jsonl
+      （只保留 _judge_verdict == "correct" 的子集，作为 Distillation
+      (SFT) 的主要池）
+
+  # 在已 vLLM 起一个 FP8 中大模型作为 judge（served-model-name 为
+  # qwen3-fp8）的前提下，调 run_math_judge_vllm.py 给每条样本打标签
+  uv run run_math_judge_vllm.py \
+    --input_json distillation_results_new.jsonl \
+    --solutions_json math_full_minus_math500.json \
+    --output_json distillation_results_new_judged.jsonl \
+    --base_url http://localhost:8000/v1 \
+    --model qwen3-fp8 \
+    --max_tokens 2048 \
+    --concurrency 64
+
+- Judging is easier than solving。一个自己未必能稳定做出来的题，judge
+  模型还是可以可靠地判断"这个候选证明的最终答案是否正确"。这个不对称性正
+  是 LLM-as-a-judge 划算的根本原因。
+
+- 利用这种不对称性，可以把 judge 跑得很快。两条合理的路线：
+    * 用更小的 judge 模型，比如 Qwen3.6-27B 量级的、配合 FLA / GDN 的
+      serving。便宜，但本项目里 prompt 比较长（题目本身 + 多步证明 trace），
+      过小的 judge 容易飘，会出现误判。
+    * 用稍大的 judge 模型 + 更高效的 serving：vLLM + TP / EP，权重开 FP8。
+      FP8 能用满 tensor cores，相对 BF16 大致能翻倍吞吐，而对 judging
+      这类任务的质量损失可以忽略；同时传统 FlashAttention 的 kernels
+      也更成熟。最终采用 FP8 中大模型 + vLLM 的方案，质量 / 成本比
+      最佳。
+
+- 以 "judged correct" 子集（qwen3-235b-a22b-distillation-answer-
+  pairs.judged.correct.jsonl）作为主要的 Distillation (SFT) 池。也试过保
+  留少量 judged-incorrect 样本：理由是有些"错"其实是 judge 自己判错了，
+  另外少量的接近正确的样本可以起到一定的正则作用。但默认配置仍然是把判
+  错的丢掉。
+
+
+2b. Perplexity 过滤
+-------------------
+
+- 相关脚本：compute_perplexity_vllm.py（用学生 base model 跑一遍前向，
+  对每条 (problem, answer) 计算平均 token logprob，再 exp 得到 PPL；
+  并附带去重逻辑）
+- 输入：上一步的 .judged.correct.jsonl（也包括 distillation_results_
+  new_judged_correct_dedup.jsonl 这类已去重的中间产物）
+- 产物：distillation_results_new_judged_correct_dedup.ppl_filtered.jsonl
+  （砍掉 PPL 极高的那一档之后的 Distillation (SFT) 训练集）
+
+  # 在已 vLLM 起学生 base model（端口 8000）的前提下，跑
+  # compute_perplexity_vllm.py 计算每条样本的平均 logprob → PPL
+  uv run compute_perplexity_vllm.py \
+    --data_path distillation_results_new_judged_correct_dedup.jsonl \
+    --model /opt/tiger/tianhao.yao/models/qwen3-0.6b-base \
+    --host localhost --port 8000 \
+    --concurrency 128 \
+    --max_seq_len 6143 \
+    --out_file perplexity_results.json
+
+出发点是难度筛选的常见思路——"太难的学不会，太简单的学了也意义不
+大"：PPL 过高的样本对 0.6B 小模型而言基本超纲，强行去学得到的多是死
+记硬背而非泛化；PPL 过低的样本则信息量稀薄，即便学了对模型能力的提
+升也有限。
+
+但这一过滤手段存在明显局限，因此使用时需要谨慎：
+
+- 在 distillation 阶段，学生需要同时学两件事：(a) 数学证明本身的难度和内
+  容；(b) teacher 的格式和组织方式。Perplexity 把这两者混在一起。一个简
+  短简单的证明如果格式对学生来说不熟悉，PPL 反而会比一个又长又难但格式熟
+  悉的证明高 —— 这跟想要筛掉的方向恰好相反。
+
+- 具体计算时是把 per-token logprob 取平均后再 exp。在长答案上，这个平均值
+  会被大量"胶水 token"（空格、$ $、"Step"、"Therefore"、换行等）稀释。结
+  果是真正难的少数 token 的信号被冲淡，既会有 false negative（真难的题分
+  数看起来不高），也会有 false positive（一些简单或难度适中的题因为某个
+  不寻常的措辞被划入"高 perplexity"区间）。
+
+- 因此，PPL 过滤被定位成一个粗筛，而不是最终判定。具体使用
+  时配合阈值附近样本的人工抽检，确保切线没切歪。
+
+
+--------------------------------------------------------------------------------
+3. Distillation (SFT) 阶段
+--------------------------------------------------------------------------------
+
+train_qwen3_0.6b_sft.py 在过滤后的 distillation 集上对 Qwen3-0.6B 做监督
+微调。产物 checkpoint 放在 models/ 下，命名里带数据切片和训练 recipe（如
+qwen3-0.6b-sft-distill-a22b-allcorrect-6144-mrbl-bs8）。这个
+Distillation (SFT) checkpoint 就是后面 GRPO 的起点。
+
+  # 主 SFT：从 qwen3-0.6b-base 起步，用过滤+去重后的 distillation 集训 3 ep
+  uv run train_qwen3_0.6b_sft.py \
+    --data_path ./distillation_results_new_judged_correct_dedup.jsonl \
+    --model_name_or_path /opt/tiger/tianhao.yao/models/qwen3-0.6b-base \
+    --output_dir /opt/tiger/tianhao.yao/models/qwen3-0.6b-sft-distill-a22b-allcorrect-2790-mrbl-bs8-new-dedup-nfa \
+    --epochs 3 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 1 \
+    --lr 1.5e-5 \
+    --warmup_ratio 0.03 \
+    --max_grad_norm 1.0 \
+    --max_seq_len 2790 \
+    --seed 442 \
+    --attn_implementation sdpa \
+    --precision bf16-mixed \
+    --no_compile_model
+
+几点工程考量：
+
+- 截断长度和 distillation 的长度预算（3072–4096）匹配。这就是前面阶段为什
+  么要费力压短 teacher trace 的原因 —— Distillation (SFT) 的 loss 是在
+  （可能被截断的）token 上计算的，长 trace 一旦被截在证明中段，相当于在
+  教学生"写到一半就停"，是最糟糕的训练信号，连 \boxed{} 都给不出来。
+
+- 学生学到的 chain of thought 就是 teacher 输出的样子：紧凑的 "Step 1 /
+  Step 2 / ... / Final answer"，几乎没有填充。这正是第一阶段 prompt
+  engineering 和 teacher 选择的全部目的。
+
+- 为什么不用 soft distillation：另一种常见做法是让学生匹配 teacher 的
+  logits 分布（offline soft distillation 缓存 logits，或 online soft
+  distillation 让学生自采样、由 teacher 沿轨迹打分）。这套方案在开放
+  式生成任务上具有优势，但对于"答案唯一"的数学题，专家经验和我们的
+  ablation 都指向同一结论：直接学习 teacher 的硬标签即可，匹配整个分
+  布带来的更多是噪声，无法抵消额外的基础设施成本（缓存 logits、长期
+  serve teacher 等）。因此本 pipeline 的"distillation"在实现上等价
+  于一次常规的 Distillation (SFT)。
+
+
+--------------------------------------------------------------------------------
+4. GRPO 阶段
+--------------------------------------------------------------------------------
+
+在 Distillation (SFT) 完成后进行 GRPO 训练（grpo.py、
+train_grpo_qwen3_math.py、grpo_reward.py），训练数据为带可验证字符
+串等价奖励的数学题（DAPO-Math-17k 的子集，由 prepare_dapo_300.py /
+extend_dapo_to_600.py 生成；训练文件分别为 grpo_train_dapo300.json、
+grpo_train_dapo600.json、grpo_train_dapo1200.json）。
+
+需要注意的点：
+
+- GRPO 比 Distillation (SFT) 明显更慢。每一步 GRPO 在梯度更新之外，还
+  要从当前 policy 上采样 N 个候选（rollout）、计算 reward，单步的
+  wall-clock 一般是 Distillation (SFT) 的数倍。用 vLLM 作为 rollout 后
+  端（serve_vllm_grpo.py、vllm_client.py）来把这个开销压下来。
+
+    # rollout 后端：把当前 policy serve 起来供 GRPO 训练循环采样
+    uv run serve_vllm_grpo.py \
+      --model models/qwen3-0.6b-sft-distill-a22b-allcorrect-6144-targeted96-lr1e-7-seed442-2 \
+      --port 8000 --max-model-len 8192 \
+      --gpu-memory-utilization 0.85 --dtype bfloat16
+
+- Reward 设计：GRPO 的训练信号完全来自 reward function，因此 reward
+  的定义比训练循环本身更关键。本项目主要走"可验证 reward (RLVR)"路
+  线，同时评估了几种可选项（grpo_reward.py 为主实现，其余部分做过实
+  验、部分仅作接口预留）：
+
+    1. 可验证字符串/数值等价（主用）
+       从 \boxed{...} 里抽出最终答案，与 ground truth 做规范化后的字
+       符串等价比较。便宜、确定、零幻觉，是数学 RLVR 的默认选择。缺点
+       是对"语义等价但形式不同"的答案（例如 1/2 vs 0.5、\frac{a+b}{2}
+       vs \frac{b+a}{2}）会误判 0 分，需要在归一化函数上花功夫。
+
+    2. 数学等价验证（sympy / math-verify）
+       在 1 的基础上叠一个符号化校验：把候选答案和 ground truth 都过
+       sympy 化简，再判等价。能正确处理代数恒等、三角恒等、单位换算等
+       场景。比纯字符串严格但比 LLM 判官便宜得多。代价是 sympy 偶尔会
+       超时或挂在病态表达式上，需要超时保护。
+
+    3. LLM-as-a-judge as reward（vLLM serve）
+       与第 2 阶段的"判蒸馏数据对错"完全同构：起一个 vLLM 服务（FP8
+       中大模型 + TP/EP），让它对每条 rollout 打 0/1 或更细的分数，再
+       把分数反馈给 GRPO。优点是能处理证明过程的合理性、单位、表述等
+       字符串/sympy 抓不到的维度；缺点是 (a) judge 本身有噪声、会引入
+       reward hacking 的风险（policy 可能学会"骗 judge"），(b) 每条
+       rollout 多一次 LLM 调用，wall-clock 显著上涨，(c) 训练侧最好对
+       judge 也做 truncated importance sampling 类的稳定化。本项目已
+       具备 FP8 judge 的 serve（run_math_judge_vllm.py），将其接入
+       GRPO 的 reward hook 已具备工程基础，列为下一步的扩展方向。
+
+    4. Format reward
+       对输出格式给一个小的额外奖励：是否给出 \boxed{}、是否按
+       Step 1 / Step 2 组织、是否含 "<think>" 标签等。在本项目的
+       setup 中，Distillation (SFT) 已经把格式压得很死，format reward
+       边际收益不大，因此未启用；但如果直接从 base model 跑 RLVR，这
+       一项会变得很关键。
+
+    5. Length penalty
+       对超长 trace 做线性或软惩罚，避免 policy 通过"无限拖长链路"提
+       升正确率（这是 RLVR 一个常见的退化方向）。可以与 truncation
+       配合使用。
+
+    6. Process / step-level reward（PRM）
+       不再只评最终答案，而是按推理步骤逐步打分。需要训练或获取一个
+       PRM 模型（process reward model），成本最高但理论上信号最稠密。
+       小模型 + 数学场景下 PRM 的稳定性还在演进，本 pipeline 暂未引
+       入，列为后续工作。
+
+    7. 多 reward 加权 / 归一化聚合
+       上面几种 reward 可以同时启用、加权求和。如果使用，建议每个
+       reward 在组内分别归一化后再聚合（参见下文 (e) 段提到的 GDPO
+       思路），避免某一项的量级吞掉其他。
+
+  当前主 pipeline 用的是 (1) + (2) 的组合（字符串等价为主，sympy 兜
+  底）；(3) 的 LLM-judge reward 已具备工程基础，是下一步的扩展方向。
+
+- 对于"有可验证标量奖励"的数学场景，GRPO 的标准菜谱可以做不少简化。
+  GRPO 自 2024 年（DeepSeekMath）提出、2025 年（DeepSeek-R1）走红以
+  来，文献里积累出了一长串改进。本项目挑选其中最显著的几条做了考
+  量，部分实际应用，部分仅在 ablation 中尝试：
+
+    (a) No KL loss（DAPO、Dr. GRPO、DeepSeek V3.2）
+        KL-to-reference 项对"答案唯一可验证"的数学任务收益很小。它的
+        本意是防 reward hacking 与风格塌缩，但本项目的 reward 是数值
+        正确性，policy 又有较强的 Distillation (SFT) 先验，drift 不会
+        病态化。直接把 KL 系数置 0，模型才能真正"动起来"。DeepSeek
+        V3.2 进一步建议按领域调 KL 强度——math 给 0、通用对话给一个
+        小正值。与此一脉相承的是：本项目同样未在 GRPO 阶段加入用于缓
+        解灾难性遗忘的 pretrain / replay 任务，前提都是"训练域局限于
+        数学，且 SFT 先验已足够强"；推广到通用多任务场景时，两者均需
+        重新评估。
+
+    (b) Clip-higher（DAPO）
+        非对称的 PPO clipping：正 advantage 一侧的 clip 上界比负
+        advantage 一侧更宽松（例如 ε_high = 0.28、ε_low = 0.2）。让
+        policy 更果断地把"对的解法"学进去，避免在某点附近反复振荡。
+
+    (c) Token-level loss（DAPO）
+        把 loss 在 token 维度上聚合而不是 sequence 维度上平均，避免短序
+        列被低估、长序列被压平。对长 chain-of-thought 尤其重要。
+
+    (d) Zero-gradient filtering + Active sampling（DAPO）
+        组内 N 个 rollout 全对或全错的题，advantage 全为 0、对梯度没贡
+        献，但仍然占用前向、KV cache、显存。直接跳过这类 batch 省算力；
+        再顺势走一步，遇到 zero-gradient prompt 就重采下一个，直到拿到
+        有梯度信号的那一条再去更新，让每一步真正"值钱"。
+
+    (e) Truncated importance sampling（Yao et al., 2025）
+        对 importance ratio 做截断，缓解 rollout policy 与 train policy
+        不一致带来的方差爆炸。在 vLLM rollout + 训练后端精度/实现
+        不同的场景下尤其相关——两边的 logprob 本来就不会完全一致。
+
+  落地到本 pipeline 上，明确启用的是 (a)、(b) 以及 DAPO 风格的
+  (c)、(d)；(e) 以及更激进的改动（sequence-
+  level IS、weight clipping、多 reward 归一化）未进入主 pipeline，留作后续遇到瓶颈时再行评估。
+
+
+--------------------------------------------------------------------------------
+5. Test-Time Scaling / 评测
+--------------------------------------------------------------------------------
+
+最终评测在 MATH-500（math500_test.json）上完成，相关脚本为
+evaluate_math500_vllm.py 以及带 test-time scaling 的
+evaluate_math500_vllm_tts.py，结果文件 math500*.json。本项目刻意不
+只报一个数字，而是给出一组指标，因为它们各自衡量的是不同的方面：
+
+  # 在已 vLLM serve 起待评的 SFT checkpoint（served-model-name 为
+  # qwen3-0.6b-sft）的前提下，跑 MATH-500 评测
+  uv run evaluate_math500_vllm.py \
+    --port 8000 \
+    --input_path math500.json \
+    --model qwen3-0.6b-sft \
+    --mode completions \
+    --dataset_size 500 \
+    --max_new_tokens 4096 \
+    --concurrency 256 \
+    --out_file math500_qwen3-0.6b-sft_vllm.json
+
+  # 输出示例：
+  #   MATH-500 (vLLM): 500/500 | ETA: 00s
+  #   Accuracy: 46.40% (232/500)  |  wall time: 26.0s
+  #   Wrote per-problem results to math500_qwen3-0.6b-sft_vllm.json
+
+
+- Greedy accuracy：temperature=0 单次采样。最便宜也最可复现的"模型自己最
+  相信的答案对不对"指标。对单 token 的偏差很敏感。
+
+- avg@1：非零温度下，单次独立采样的平均准确率。在校准良好时一般略低于
+  greedy；如果 greedy 模式恰好是一个"自信的错答"，而周围的采样空间里有不
+  少正确答案，那 avg@1 反而会高于 greedy。
+
+- pass@N：N 次独立采样里有任何一次正确，就算这道题对。是 test-time search
+  能达到的上限。作为"潜力"指标使用 —— 如果 pass@N 远大于 avg@1，说明模型
+  在某些采样上是知道怎么做的，瓶颈在 selector 而不在 capability。
+
+- cons@N（majority vote / self-consistency）：N 次采样后取最常出现的最终
+  答案。最便宜的 test-time scaler，在数学任务上几乎一定优于 avg@1。
+
+- wcons@N（confidence-weighted consistency）：在 cons@N 的基础上按每个
+  样本的 confidence 加权，比如最终答案 span 的平均 logprob、或者 judge 的
+  打分。在模型校准合理时一般优于纯 cons@N；校准不好的时候会退化但不会很
+  差。
+
+将 greedy / avg@1 / cons@N / wcons@N / pass@N 联合考察，可以区分不
+同的失败模式：
+    - greedy 低、pass@N 高           → 采样 / 选择问题（capability
+                                        足够，但 selector 不行）
+    - greedy ≈ pass@N，且都偏低      → 能力瓶颈，需要更强的
+                                        Distillation (SFT) / GRPO
+    - cons@N 远高于 avg@1            → policy 平均意义上是对的，但单
+                                        次采样噪声大
+    - wcons@N 远高于 cons@N          → confidence 信号有效，值得做成
+                                        正式的 verifier
+
+本项目目前实际启用的 test-time scaling 手段：
+
+  - Majority vote / self-consistency (cons@N)：N 次独立采样后取最常见
+    的最终答案。最便宜、几乎一定优于 avg@1。
+  - Weighted majority vote (wcons@N)：在 cons@N 基础上按每条样本最终
+    答案 span 的平均 logprob 加权，等价于自带 confidence 信号的
+    self-consistency。
+  - Tie breaking：当 vote 出现并列时，用平均 logprob（或最大 logprob）
+    破平，优先选 model 更"自信"的那一支，避免随机回退。
+  - Distilled-in chain of thought（不靠 prompt trigger）：student 的
+    CoT 不是通过 "let's think step by step" 之类的 prompt 触发，也不
+    挂 <think> 标签，而是 Distillation (SFT) 阶段就把
+    "Step 1 / Step 2 / ... / Final answer" 的格式固化进了权重里。这
+    样推理行为不会因为 system prompt 改写或 chat template 切换而退
+    化，所有 TTS 策略也都建立在"模型默认就会 reasoning"的前提之上。
+
+下一步可以接入但尚未进入 pipeline 的方向：
+
+  - Self-reflection / self-correction / self-refinement：让模型对自己
+    的答案做一次 critique → 修订（Self-Refine / Reflexion 风格）。由
+    logprob 和启发式触发 —— 仅当某条 trace 的最终答案 span 平均
+    logprob 低于阈值，或 cons@N 内部仍存在分歧时，才走第二轮 refine；
+    refine 后若 logprob 提升达到一定幅度则直接接受、提升不显著（或低
+    于阈值）则停止，避免对已经"自信且一致"的样本浪费额外算力。
+  - Logprob-based early exit / adaptive N：在 N 次采样过程中在线监控
+    累计 confidence（top-answer 票数 × 平均 logprob），超过阈值即停
+    止采样，用更少的样本数逼近 fixed-N 的准确率。
+
+
+--------------------------------------------------------------------------------
+6. Pipeline 总览
+--------------------------------------------------------------------------------
+
+     Teacher（instruct, 不用 2507-thinking）
+         |  严格的 step-by-step prompt，长度截断
+         v
+     原始 distillation traces
+         |  LLM-as-a-judge（FP8 vLLM serve, TP/EP）→ 丢错答
+         |  Perplexity filter（学生 base model 下打分）→ 谨慎丢高 PPL
+         v
+     Distillation (SFT) 语料（sft.jsonl, ...dedup.jsonl,
+                              ...ppl_filtered.jsonl）
+         |  train_qwen3_0.6b_sft.py（hard-label Distillation (SFT)）
+         v
+     Distillation (SFT) checkpoint（models/qwen3-0.6b-sft-distill-...）
+         |  GRPO on DAPO-Math-17k，可验证 reward
+         |  （KL 关闭、clip-higher、组内相对 advantage）
+         v
+     GRPO checkpoint（grpo_runs/.../step-XXXXX-pXXXXX）
+         |  在 MATH-500 上做 test-time scaling
+         |  greedy / avg@1 / cons@N / wcons@N / pass@N
+         |  cons@N + logprob-weighted vote + tie breaking
+         |  CoT 由 SFT 训进权重，不靠 prompt trigger / <think> 标签
+         v
+     最终上报数字
+
+
+--------------------------------------------------------------------------------
+7. 经验小结
+--------------------------------------------------------------------------------
+
+1. 对 0.6B 的学生模型，teacher 的"风格"和"强度"一样重要。一个偏弱但简洁
+   的 teacher，往往比一个更强但啰嗦的 teacher 更适合做蒸馏源。
+
+2. Perplexity-based 数据过滤有用但很粗糙：长答案的平均 logprob 容易被简单
+   token 稀释，false positive 不少。把它当 hint 用，配合 judge 的正确性过
+   滤和阈值附近的人工抽检，不要拿它当最终判据。
+
+3. LLM-as-a-judge 是数据 pipeline 里最值得花 FP8 / TP / EP 工程力气的一
+   环：judging 比 solving 容易，所以"快的大模型 judge"几乎一定优于"慢的小
+   模型 judge"。
+
+4. 在可验证数学奖励上跑 GRPO，关 KL + clip-higher 是显著有效的两个调整。
+   KL 项主要是给开放式任务用的。
+
+5. 数学蒸馏采用 hard-label Distillation (SFT) 比 soft logit
+   distillation 更划算——关键信号在于"选哪个 token"，而不在整个分
+   布。这也是为什么本项目中"distillation"与"SFT"实际是同一件事。
+
+6. 评测一定要报一组指标（greedy / avg@1 / cons@N / wcons@N / pass@N），
+   单一数字会掩盖瓶颈到底是 capability、sampling 还是 selection。当前
+   实际启用的 TTS 是 majority vote + logprob 加权投票 + tie breaking
+   三件套；CoT 由 Distillation (SFT) 训进权重而非 prompt 触发，所以
+   推理行为对 system prompt / chat template 改动是稳健的。下一步可加
+   logprob 触发的 self-refinement 与 adaptive-N 早停 —— 这两类方法只
+   在不确定或不一致的样本上多花算力，已经"自信且一致"的样本不再消耗。
